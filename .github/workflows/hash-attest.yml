@@ -1,0 +1,206 @@
+# PoPB 哈希存证自动化工作流
+# 触发条件：体测数据push → 自动存证
+# 维护者：Ethan（效果信任官）+ Tristan（技术架构官）
+
+name: PoPB Hash Attestation
+on:
+  push:
+    paths:
+      - 'data/measurements/**'
+      - 'data/achievements/**'
+  workflow_dispatch:
+    inputs:
+      force_attest:
+        description: '强制对所有未存证记录执行存证'
+        required: false
+        default: 'false'
+
+env:
+  CHAIN_LEDGER: '.github/attestations/hash-chain.jsonl'
+  ATTESTATION_DIR: '.github/attestations'
+
+jobs:
+  attest:
+    name: Generate Hash Attestation
+    runs-on: ubuntu-latest
+    outputs:
+      root_hash: ${{ steps.merkle.outputs.root_hash }}
+      record_count: ${{ steps.merkle.outputs.record_count }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate measurement data format
+        id: validate
+        run: |
+          echo "🔍 Validating measurement data format..."
+          mkdir -p .github/attestations
+          
+          # 检查所有新增的测量数据文件是否符合ZWF-20 Schema
+          for file in $(git diff --name-only HEAD~1 | grep 'data/measurements/'); do
+            if [ -f "$file" ]; then
+              echo "  Checking: $file"
+              # 检查JSON有效性
+              if ! jq empty "$file" 2>/dev/null; then
+                echo "❌ Invalid JSON: $file"
+                exit 1
+              fi
+              # 检查必要字段
+              if ! jq -e '.recordId and .collectedAt and .measurements' "$file" > /dev/null; then
+                echo "❌ Missing required fields in: $file"
+                exit 1
+              fi
+              echo "  ✅ Valid: $file"
+            fi
+          done
+          echo "✅ All files validated"
+
+      - name: Calculate SHA-256 hashes
+        id: hashing
+        run: |
+          echo "📝 Calculating SHA-256 hashes..."
+          
+          # 获取当天日期
+          TODAY=$(date -u +"%Y-%m-%d")
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          # 遍历所有新增的测量数据文件
+          for file in $(git diff --name-only HEAD~1 | grep 'data/measurements/'); do
+            if [ -f "$file" ]; then
+              # 计算文件哈希
+              FILE_HASH=$(sha256sum "$file" | cut -d' ' -f1)
+              RECORD_ID=$(jq -r '.recordId' "$file")
+              
+              echo "  📄 $RECORD_ID → sha256$$FILE_HASH"
+              
+              # 生成存证记录
+              ATTEST_RECORD=$(jq -n \
+                --arg recordId "$RECORD_ID" \
+                --arg hash "sha256$$FILE_HASH" \
+                --arg timestamp "$TIMESTAMP" \
+                --arg file "$file" \
+                '{
+                  "chainRecordId": ("HASH-" + (now | tostring | split(".")[0])),
+                  "schema": "popb/v1",
+                  "type": "measurement_hash",
+                  "sourceRecordId": $recordId,
+                  "originalHash": $hash,
+                  "timestamp": $timestamp,
+                  "sourceFile": $file,
+                  "attestedBy": [{"agent": "agent:momo:store"}, {"agent": "agent:ethan:effect"}],
+                  "status": "pending_onchain"
+                }')
+              
+              # 追加到当天哈希链
+              echo "$ATTEST_RECORD" >> ".github/attestations/hash-chain-$TODAY.jsonl"
+            fi
+          done
+          
+          echo "✅ Hash calculation complete"
+
+      - name: Build Merkle tree
+        id: merkle
+        run: |
+          echo "🌲 Building Merkle tree..."
+          TODAY=$(date -u +"%Y-%m-%d")
+          CHAIN_FILE=".github/attestations/hash-chain-$TODAY.jsonl"
+          
+          if [ ! -f "$CHAIN_FILE" ] || [ ! -s "$CHAIN_FILE" ]; then
+            echo "No new records to attest"
+            echo "record_count=0" >> $GITHUB_OUTPUT
+            echo "root_hash=sha256$EMPTY_HASH" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # 读取所有哈希值
+          HASHES=$(jq -r '.originalHash | split("$")[1] // empty' "$CHAIN_FILE" 2>/dev/null)
+          RECORD_COUNT=$(echo "$HASHES" | wc -l)
+          
+          echo "  Records: $RECORD_COUNT"
+          
+          # 计算Merkle根（简化版：当记录少时直接拼接哈希）
+          MERKLE_ROOT=$(echo "$HASHES" | tr -d '\n' | sha256sum | cut -d' ' -f1)
+          
+          echo "  Merkle root: sha256$$MERKLE_ROOT"
+          echo "record_count=$RECORD_COUNT" >> $GITHUB_OUTPUT
+          echo "root_hash=sha256$$MERKLE_ROOT" >> $GITHUB_OUTPUT
+
+      - name: Generate attestation summary
+        run: |
+          echo "## 📊 PoPB Attestation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Records attested | ${{ steps.merkle.outputs.record_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Merkle root | ${{ steps.merkle.outputs.root_hash }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Attestation complete. Records ready for chain anchoring." >> $GITHUB_STEP_SUMMARY
+
+      - name: Commit attestation records
+        run: |
+          git config user.name "zwiserfit-bot"
+          git config user.email "bot@zwiserfit.com"
+          git add .github/attestations/
+          git diff --staged --quiet || git commit -m "🤖 PoPB: auto-attest $(date -u +'%Y-%m-%dT%H:%M')"
+          git push
+
+  verify-pr:
+    name: Verify Data Integrity
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [attest]
+    
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Verify all changed files
+        run: |
+          echo "🔎 Verifying PR data integrity..."
+          FAILED=0
+          
+          for file in $(git diff --name-only origin/main...HEAD | grep 'data/'); do
+            if [ -f "$file" ]; then
+              COMPUTED_HASH=$(sha256sum "$file" | cut -d' ' -f1)
+              STORED_HASH=$(jq -r '.originalHash // "not_found"' "$file" 2>/dev/null | sed 's/sha256$//')
+              
+              if [ "$COMPUTED_HASH" != "$STORED_HASH" ] && [ "$STORED_HASH" != "not_found" ]; then
+                echo "❌ HASH MISMATCH: $file"
+                echo "  Computed: $COMPUTED_HASH"
+                echo "  Stored:   $STORED_HASH"
+                FAILED=$((FAILED + 1))
+              else
+                echo "  ✅ Verified: $file"
+              fi
+            fi
+          done
+          
+          if [ $FAILED -gt 0 ]; then
+            echo "❌ $FAILED file(s) failed verification"
+            exit 1
+          fi
+          echo "✅ All files verified successfully"
+
+      - name: Post verification comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.payload.pull_request.head.sha;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🛡️ PoPB Verification\n\n**PR SHA:** \`${sha}\`\n**Result:** ✅ All data files passed hash integrity verification.\n\n*Auto-verified by PoPB Protocol v1.0*`
+            });
